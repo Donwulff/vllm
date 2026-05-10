@@ -751,7 +751,7 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{prefix}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
-        self.scale_fmt = config.quantization_config["scale_fmt"]
+        self.scale_fmt = config.quantization_config.get("scale_fmt")
 
         self.rope_parameters = config.rope_scaling
 
@@ -1071,6 +1071,41 @@ class DeepseekV4DecoderLayer(nn.Module):
         return self._forward_cuda(x, positions, input_ids, post_mix, res_mix, residual)
 
 
+def _dequantize_gptq_w4a16_to_dense(
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    # GateLinear hardcodes quant_config=None, but AutoRound checkpoints
+    # quantize the gate. Materialize qweight/qzeros/scales back to a dense
+    # [out, in] tensor that GateLinear's `weight` parameter can absorb.
+    # GPTQ +1 zero-point convention; works for sym (qz=2^(b-1)-1) and asym.
+    pack_factor = qweight.shape[1] // qzeros.shape[1]
+    bits = 32 // pack_factor
+    in_packed, out_features = qweight.shape
+    in_features = in_packed * pack_factor
+    num_groups = scales.shape[0]
+    group_size = in_features // num_groups
+    mask = (1 << bits) - 1
+    device = scales.device
+
+    qw = qweight.to(device=device, dtype=torch.int32)
+    w = torch.empty((in_features, out_features), dtype=torch.int32, device=device)
+    for i in range(pack_factor):
+        w[i::pack_factor, :] = (qw >> (bits * i)) & mask
+
+    qz = qzeros.to(device=device, dtype=torch.int32)
+    zp = torch.empty((num_groups, out_features), dtype=torch.int32, device=device)
+    for i in range(pack_factor):
+        zp[:, i::pack_factor] = (qz >> (bits * i)) & mask
+
+    zp_full = (zp + 1).repeat_interleave(group_size, dim=0).to(torch.float32)
+    scales_full = scales.to(torch.float32).repeat_interleave(group_size, dim=0)
+    deq = (w.to(torch.float32) - zp_full) * scales_full
+    return deq.t().contiguous().to(out_dtype)
+
+
 @support_torch_compile
 class DeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -1274,6 +1309,18 @@ class DeepseekV4Model(nn.Module):
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()
 
+        # AutoRound checkpoints quantize ffn.gate too, but GateLinear holds
+        # an unquantized `weight`. Stash the quantized tensors here and
+        # dequantize them after the main loop.
+        gate_quant_fields = ("qweight", "qzeros", "scales", "g_idx")
+        pending_gate_quant: dict[str, dict[str, torch.Tensor]] = {}
+        # AutoRound also quantizes compressor.wkv/wgate, which fuse into an
+        # unquantized `compressor.fused_wkv_wgate.weight`. Stash per shard
+        # and feed the dense tensor through the merged weight_loader.
+        pending_compressor_quant: dict[
+            str, dict[int, dict[str, torch.Tensor]]
+        ] = {}
+
         for name, loaded_weight in weights:
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
@@ -1285,6 +1332,17 @@ class DeepseekV4Model(nn.Module):
 
                 if is_pp_missing_parameter(name, self):
                     break
+
+                base, _, suffix = name.rpartition(".")
+                if (
+                    suffix in gate_quant_fields
+                    and base.endswith("compressor.fused_wkv_wgate")
+                ):
+                    pending_compressor_quant.setdefault(base, {}).setdefault(
+                        shard_id, {}
+                    )[suffix] = loaded_weight
+                    break
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -1336,6 +1394,15 @@ class DeepseekV4Model(nn.Module):
                     params_dict[name][:n].copy_(narrow_weight)
                     loaded_params.add(name)
                     continue
+                elif (
+                    ".ffn.gate." in name
+                    and name.rsplit(".", 1)[-1] in gate_quant_fields
+                ):
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    base, field = name.rsplit(".", 1)
+                    pending_gate_quant.setdefault(base, {})[field] = loaded_weight
+                    continue
                 else:
                     if is_pp_missing_parameter(name, self):
                         continue
@@ -1346,6 +1413,70 @@ class DeepseekV4Model(nn.Module):
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
                     continue
+
+        for base, parts in pending_gate_quant.items():
+            weight_param = params_dict.get(f"{base}.weight")
+            if weight_param is None or "qweight" not in parts \
+                    or "scales" not in parts or "qzeros" not in parts:
+                continue
+            dequantized = _dequantize_gptq_w4a16_to_dense(
+                qweight=parts["qweight"],
+                qzeros=parts["qzeros"],
+                scales=parts["scales"],
+                out_dtype=weight_param.dtype,
+            )
+            weight_param.data.copy_(dequantized.to(weight_param.device))
+            loaded_params.add(f"{base}.weight")
+
+        for base, shards in pending_compressor_quant.items():
+            weight_param = params_dict.get(f"{base}.weight")
+            if weight_param is None:
+                continue
+            weight_loader = getattr(
+                weight_param, "weight_loader", default_weight_loader
+            )
+            for shard_id, parts in shards.items():
+                if "qweight" not in parts or "scales" not in parts \
+                        or "qzeros" not in parts:
+                    continue
+                dequantized = _dequantize_gptq_w4a16_to_dense(
+                    qweight=parts["qweight"],
+                    qzeros=parts["qzeros"],
+                    scales=parts["scales"],
+                    out_dtype=weight_param.dtype,
+                )
+                weight_loader(
+                    weight_param,
+                    dequantized.to(weight_param.device),
+                    shard_id,
+                )
+            loaded_params.add(f"{base}.weight")
+
+        # AutoRound also quantizes attn.wo_a as W4A16, but the V4 attention
+        # forward path consumes wo_a via an FP8 einsum kernel (reads .weight
+        # and .weight_scale_inv directly). Dequant W4A16 -> BF16 once and
+        # attach as a dense `weight` Parameter; the forward path falls back
+        # to a BF16 einsum when weight_scale_inv is absent.
+        for module_name, module in self.named_modules():
+            if not module_name.endswith(".wo_a"):
+                continue
+            if hasattr(module, "weight") or not hasattr(module, "qweight"):
+                continue
+            qzeros = getattr(module, "qzeros", None)
+            scales = getattr(module, "scales", None)
+            if qzeros is None or scales is None:
+                continue
+            dequantized = _dequantize_gptq_w4a16_to_dense(
+                qweight=module.qweight.data,
+                qzeros=qzeros.data,
+                scales=scales.data,
+                out_dtype=torch.bfloat16,
+            )
+            module.weight = torch.nn.Parameter(
+                dequantized.to(module.qweight.device),
+                requires_grad=False,
+            )
+            loaded_params.add(f"{module_name}.weight")
 
         return loaded_params
 
