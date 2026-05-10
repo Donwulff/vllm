@@ -321,35 +321,47 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             return self.wo_b(z.flatten(1))
 
-        # O projection: inverse RoPE + FP8 quant + einsum + wo_b
-        o_fp8, o_scale = fused_inv_rope_fp8_quant(
-            o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            n_groups=self.n_local_groups,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.rope_head_dim,
-            tma_aligned_scales=self._tma_aligned_scales,
-        )
+        # O projection: inverse RoPE + FP8 einsum, with a BF16 fallback for
+        # AutoRound W4A16 wo_a (dequanted to BF16 at load -> no weight_scale_inv).
+        if hasattr(self.wo_a, "weight_scale_inv"):
+            o_fp8, o_scale = fused_inv_rope_fp8_quant(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                tma_aligned_scales=self._tma_aligned_scales,
+            )
 
-        wo_a_fp8 = self.wo_a.weight
-        wo_a_scale = self.wo_a.weight_scale_inv
+            wo_a_fp8 = self.wo_a.weight
+            wo_a_scale = self.wo_a.weight_scale_inv
 
-        z = torch.empty(
-            (num_tokens, self.n_local_groups, self.o_lora_rank),
-            device=o.device,
-            dtype=torch.bfloat16,
-        )
-        torch.ops.vllm.deepseek_v4_fp8_einsum(
-            o_fp8,
-            o_scale,
-            wo_a_fp8,
-            wo_a_scale,
-            z,
-            "bhr,hdr->bhd",
-            list(self._einsum_recipe),
-        )
+            z = torch.empty(
+                (num_tokens, self.n_local_groups, self.o_lora_rank),
+                device=o.device,
+                dtype=torch.bfloat16,
+            )
+            torch.ops.vllm.deepseek_v4_fp8_einsum(
+                o_fp8,
+                o_scale,
+                wo_a_fp8,
+                wo_a_scale,
+                z,
+                "bhr,hdr->bhd",
+                list(self._einsum_recipe),
+            )
+        else:
+            z = rocm_inv_rope_einsum(
+                self.rotary_emb,
+                o,
+                positions,
+                self.rope_head_dim,
+                self.n_local_groups,
+                self.o_lora_rank,
+                self.wo_a,
+            )
 
         return self.wo_b(z.flatten(1))
 
@@ -1124,11 +1136,14 @@ class DeepseekV4Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
+        # AutoRound checkpoints (Intel/DeepSeek-V4-Flash-W4A16-AutoRound)
+        # quantize this layer; forward path here is a plain linear call, so
+        # propagating quant_config is sufficient (no dequant-at-load needed).
         self.weights_proj = ReplicatedLinear(
             hidden_size,
             self.n_head,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.weights_proj",
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
