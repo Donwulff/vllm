@@ -16,6 +16,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -61,6 +62,8 @@ from vllm.models.deepseek_v4.attention import (
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -1017,7 +1020,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
-def _dequantize_gptq_w4a16_to_dense(
+def _dequantize_w4a16_to_dense(
     qweight: torch.Tensor,
     qzeros: torch.Tensor,
     scales: torch.Tensor,
@@ -1356,7 +1359,7 @@ class DeepseekV4Model(nn.Module):
             if weight_param is None or "qweight" not in parts \
                     or "scales" not in parts or "qzeros" not in parts:
                 continue
-            dequantized = _dequantize_gptq_w4a16_to_dense(
+            dequantized = _dequantize_w4a16_to_dense(
                 qweight=parts["qweight"],
                 qzeros=parts["qzeros"],
                 scales=parts["scales"],
@@ -1364,6 +1367,11 @@ class DeepseekV4Model(nn.Module):
             )
             weight_param.data.copy_(dequantized.to(weight_param.device))
             loaded_params.add(f"{base}.weight")
+            logger.info(
+                "Dequantized W4A16 gate %s.weight to %s",
+                base,
+                weight_param.dtype,
+            )
 
         for base, shards in pending_compressor_quant.items():
             weight_param = params_dict.get(f"{base}.weight")
@@ -1376,7 +1384,7 @@ class DeepseekV4Model(nn.Module):
                 if "qweight" not in parts or "scales" not in parts \
                         or "qzeros" not in parts:
                     continue
-                dequantized = _dequantize_gptq_w4a16_to_dense(
+                dequantized = _dequantize_w4a16_to_dense(
                     qweight=parts["qweight"],
                     qzeros=parts["qzeros"],
                     scales=parts["scales"],
@@ -1388,6 +1396,11 @@ class DeepseekV4Model(nn.Module):
                     shard_id,
                 )
             loaded_params.add(f"{base}.weight")
+            logger.info(
+                "Dequantized W4A16 compressor %s.weight to %s",
+                base,
+                weight_param.dtype,
+            )
 
         # AutoRound also quantizes attn.wo_a as W4A16, but the V4 attention
         # forward path consumes wo_a via an FP8 einsum kernel (reads .weight
@@ -1403,7 +1416,7 @@ class DeepseekV4Model(nn.Module):
             scales = getattr(module, "scales", None)
             if qzeros is None or scales is None:
                 continue
-            dequantized = _dequantize_gptq_w4a16_to_dense(
+            dequantized = _dequantize_w4a16_to_dense(
                 qweight=module.qweight.data,
                 qzeros=qzeros.data,
                 scales=scales.data,
@@ -1414,6 +1427,10 @@ class DeepseekV4Model(nn.Module):
                 requires_grad=False,
             )
             loaded_params.add(f"{module_name}.weight")
+            logger.info(
+                "Dequantized W4A16 %s to BF16 (FP8 einsum → reference einsum fallback)",
+                module_name,
+            )
 
         return loaded_params
 
